@@ -1,0 +1,10 @@
+Test Order
+Order: ORD-2024-7891
+Customer: Kavin Prasath
+Chicken Biryani x2 — ₹320
+Paneer Butter Masala x1 — ₹220
+Naan (3 pcs) x1 — ₹60
+Kulfi x2 — ₹90
+Total: ₹1,010
+Address: 12, 2nd St, Anna Nagar, Chennai
+Delivery: 45 minutes
