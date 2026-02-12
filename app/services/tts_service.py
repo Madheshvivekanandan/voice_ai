@@ -1,17 +1,19 @@
-import asyncio
 import base64
 import logging
 import math
 import os
 import struct
+from typing import Optional
+import asyncio
+from sarvamai import AsyncSarvamAI, AudioOutput
+from dotenv import load_dotenv
 
-from sarvamai import SarvamAI
-
+load_dotenv()
 logger = logging.getLogger(__name__)
 
 
 class TTSServiceError(Exception):
-    """Raised when TTS synthesis fails."""
+    pass
 
 
 class SarvamTTSService:
@@ -20,33 +22,62 @@ class SarvamTTSService:
         if not api_key:
             raise RuntimeError("SARVAM_API_KEY environment variable is not set")
 
-        self._client = SarvamAI(api_subscription_key=api_key)
+        self._client = AsyncSarvamAI(api_subscription_key=api_key)
 
-    def _call_tts(self, text: str):
-        return self._client.text_to_speech.convert(
-            text=text,
-            target_language_code="ta-IN",
-            model="bulbul:v3",
-            speaker="priya",
-            speech_sample_rate=16000,
+        # Load browser config safely
+        self.speech_sample_rate = int(
+            os.getenv("browser_speech_sample_rate", 16000)
+        )
+        self.output_audio_codec = os.getenv(
+            "browser_output_audio_codec", "pcm"
         )
 
-    async def synthesize(self, text: str) -> bytes:
-        logger.info("TTS request sent — text length: %d chars", len(text))
+        logger.info(
+            "TTS initialized — sample_rate=%s codec=%s",
+            self.speech_sample_rate,
+            self.output_audio_codec,
+        )
+
+    async def stream_synthesize(self, text: str, websocket) -> None:
+        logger.info(
+            "Streaming TTS request — text length: %d chars", len(text)
+        )
 
         try:
-            response = await asyncio.to_thread(self._call_tts, text)
+            async with self._client.text_to_speech_streaming.connect(
+                model="bulbul:v3"
+            ) as ws:
+
+                await ws.configure(
+                    target_language_code="ta-IN",
+                    speaker="pooja",
+                    speech_sample_rate=16000,
+                    output_audio_codec="linear16"
+                )
+
+                await ws.convert(text)
+                await ws.flush()
+
+                logger.info("Text sent to TTS stream and flushed")
+
+                async for message in ws:
+
+                    if isinstance(message, AudioOutput):
+                        audio_chunk = base64.b64decode(message.data.audio)
+                        # logger.info("Streaming chunk — %d bytes", len(audio_chunk))
+                        await websocket.send_bytes(audio_chunk)
+                          # 🔥 Real-time pacing
+                        bytes_per_second = self.speech_sample_rate * 2  # 16-bit PCM
+                        duration = len(audio_chunk) / bytes_per_second
+
+                        await asyncio.sleep(duration)
+                    else:
+                        logger.error("Full streaming message: %s", message)
+
+
         except Exception as e:
-            logger.error("TTS synthesis failed: %s", e)
-            raise TTSServiceError(f"TTS synthesis failed: {e}") from e
-
-        if not response.audios or not response.audios[0]:
-            logger.error("TTS response contained no audio data")
-            raise TTSServiceError("Empty audio in TTS response")
-
-        audio_bytes = base64.b64decode(response.audios[0])
-        logger.info("TTS audio received — %d bytes (PCM 16-bit 16kHz mono)", len(audio_bytes))
-        return audio_bytes
+            logger.error("Streaming TTS failed: %s", e)
+            raise TTSServiceError(str(e))
 
     @staticmethod
     def generate_fallback_tone(
@@ -57,8 +88,14 @@ class SarvamTTSService:
     ) -> bytes:
         num_samples = int(sample_rate * duration)
         samples: list[bytes] = []
+
         for i in range(num_samples):
-            value = int(amplitude * math.sin(2.0 * math.pi * frequency * i / sample_rate))
+            value = int(
+                amplitude
+                * math.sin(
+                    2.0 * math.pi * frequency * i / sample_rate
+                )
+            )
             samples.append(struct.pack("<h", value))
 
         tone = b"".join(samples)
@@ -66,18 +103,28 @@ class SarvamTTSService:
         return tone
 
 
+# -------------------------
+# Optional standalone test
+# -------------------------
 if __name__ == "__main__":
-    from dotenv import load_dotenv
+    import asyncio
 
-    load_dotenv()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     )
 
-    async def _test() -> None:
+    async def _test():
         tts = SarvamTTSService()
-        audio = await tts.synthesize("Vanakkam! How are you?")
-        print(f"Audio size: {len(audio)} bytes")
+
+        # Fake websocket for testing
+        class DummyWS:
+            async def send_bytes(self, data):
+                print(f"Received chunk: {len(data)} bytes")
+
+        await tts.stream_synthesize(
+            "Vanakkam! How are you today?",
+            DummyWS(),
+        )
 
     asyncio.run(_test())

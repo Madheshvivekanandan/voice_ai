@@ -11,24 +11,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-CHUNK_SIZE: int = 1024
-CHUNK_INTERVAL: float = 0.032
-
-
-async def _stream_audio(websocket: WebSocket, audio: bytes) -> None:
-    total = len(audio)
-    sent = 0
-    logger.info("Audio streaming started — %d bytes total", total)
-
-    while sent < total:
-        chunk = audio[sent : sent + CHUNK_SIZE]
-        await websocket.send_bytes(chunk)
-        sent += len(chunk)
-        await asyncio.sleep(CHUNK_INTERVAL)
-
-    logger.info("Audio streaming finished — %d bytes sent", sent)
-
-
 @router.websocket("/ws/audio")
 async def audio_stream(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -45,22 +27,21 @@ async def audio_stream(websocket: WebSocket) -> None:
     llm = LLMService()
     try:
         confirmation_message = await llm.generate_confirmation(raw_text)
-        logger.info("LLM confirmation: %s", confirmation_message[:80])
+        logger.info("LLM confirmation: %s", confirmation_message)
     except LLMServiceError as e:
         logger.error("LLM failed, using raw text as fallback: %s", e)
         confirmation_message = raw_text
 
     tts = SarvamTTSService()
     try:
-        audio = await tts.synthesize(confirmation_message)
+        await tts.stream_synthesize(confirmation_message, websocket)
     except TTSServiceError as e:
-        logger.error("TTS synthesis failed, using fallback tone: %s", e)
-        audio = SarvamTTSService.generate_fallback_tone()
+        logger.error("Streaming TTS failed, using fallback tone: %s", e)
+        fallback_audio = SarvamTTSService.generate_fallback_tone()
+        await websocket.send_bytes(fallback_audio)
 
+    logger.info("Waiting for incoming frames (idle mode)")
     try:
-        await _stream_audio(websocket, audio)
-
-        logger.info("Waiting for incoming frames (idle mode)")
         while True:
             message = await websocket.receive()
 
@@ -73,9 +54,3 @@ async def audio_stream(websocket: WebSocket) -> None:
 
     except WebSocketDisconnect:
         logger.info("Client %s:%s disconnected", client.host, client.port)
-    except Exception as e:
-        logger.error("Unexpected error on connection %s:%s — %s", client.host, client.port, e)
-        try:
-            await websocket.close(code=1011, reason="Internal server error")
-        except Exception:
-            pass

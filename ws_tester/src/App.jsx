@@ -1,116 +1,189 @@
-import { useState, useRef, useCallback } from "react";
+import { useRef, useState } from "react";
 
 const WS_URL = "ws://localhost:8000/ws/audio";
+const SAMPLE_RATE = 16000; // 🔥 Best for browser testing
 
 function App() {
   const [status, setStatus] = useState("Disconnected");
   const [log, setLog] = useState([]);
+
   const wsRef = useRef(null);
-  const chunksRef = useRef([]);
+  const audioCtxRef = useRef(null);
+  const micStreamRef = useRef(null);
+  const processorRef = useRef(null);
 
-  const addLog = useCallback((msg) => {
-    setLog((prev) => [...prev, `${new Date().toLocaleTimeString()} — ${msg}`]);
-  }, []);
+  const addLog = (msg) => {
+    setLog((prev) => [
+      ...prev,
+      `${new Date().toLocaleTimeString()} — ${msg}`,
+    ]);
+  };
 
+  // ===============================
+  // CONNECT WEBSOCKET
+  // ===============================
   const handleConnect = () => {
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
+    if (wsRef.current) wsRef.current.close();
 
-    setStatus("Connecting…");
+    setStatus("Connecting...");
     setLog([]);
-    chunksRef.current = [];
 
     const ws = new WebSocket(WS_URL);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
+
+    audioCtxRef.current = new (window.AudioContext ||
+      window.webkitAudioContext)({
+      sampleRate: SAMPLE_RATE,
+    });
 
     ws.onopen = () => {
       setStatus("Connected");
       addLog("WebSocket connected");
     };
 
+    // ===============================
+    // RECEIVE PCM16 AUDIO
+    // ===============================
     ws.onmessage = (event) => {
-      if (event.data instanceof ArrayBuffer) {
-        const size = event.data.byteLength;
-        chunksRef.current.push(event.data);
-        addLog(`Received audio chunk: ${size} bytes`);
-      }
-    };
+      if (!(event.data instanceof ArrayBuffer)) return;
 
-    ws.onerror = (err) => {
-      addLog(`Error: ${err.message || "WebSocket error"}`);
+      const audioCtx = audioCtxRef.current;
+      if (!audioCtx) return;
+
+      const pcmData = new Int16Array(event.data);
+      const floatData = new Float32Array(pcmData.length);
+
+      for (let i = 0; i < pcmData.length; i++) {
+        floatData[i] = pcmData[i] / 32768;
+      }
+
+      const buffer = audioCtx.createBuffer(
+        1,
+        floatData.length,
+        SAMPLE_RATE
+      );
+
+      buffer.copyToChannel(floatData, 0);
+
+      const source = audioCtx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioCtx.destination);
+      source.start();
+
+      addLog(`Playing chunk (${event.data.byteLength} bytes)`);
     };
 
     ws.onclose = () => {
       setStatus("Disconnected");
       addLog("WebSocket closed");
+      stopMic();
+    };
+
+    ws.onerror = () => {
+      addLog("WebSocket error");
     };
   };
 
-  const handlePlay = () => {
-    const chunks = chunksRef.current;
-    if (chunks.length === 0) {
-      addLog("No audio data to play");
-      return;
-    }
+  // ===============================
+  // START MICROPHONE STREAMING
+  // ===============================
+  const startMic = async () => {
+    if (!audioCtxRef.current) return;
 
-    const totalLength = chunks.reduce((sum, c) => sum + c.byteLength, 0);
-    addLog(`Playing ${chunks.length} chunks (${totalLength} bytes)`);
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        sampleRate: SAMPLE_RATE,
+        channelCount: 1,
+      },
+    });
 
-    const sampleRate = 16000;
-    const numSamples = totalLength / 2;
+    micStreamRef.current = stream;
 
-    const wavHeader = new ArrayBuffer(44);
-    const view = new DataView(wavHeader);
-    const writeStr = (offset, str) => {
-      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+    const source =
+      audioCtxRef.current.createMediaStreamSource(stream);
+
+    const processor =
+      audioCtxRef.current.createScriptProcessor(1024, 1, 1);
+
+    processorRef.current = processor;
+
+    source.connect(processor);
+    processor.connect(audioCtxRef.current.destination);
+
+    processor.onaudioprocess = (e) => {
+      const inputData = e.inputBuffer.getChannelData(0);
+
+      const pcmBuffer = new ArrayBuffer(inputData.length * 2);
+      const view = new DataView(pcmBuffer);
+
+      for (let i = 0; i < inputData.length; i++) {
+        let s = Math.max(-1, Math.min(1, inputData[i]));
+        view.setInt16(i * 2, s * 32767, true);
+      }
+
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(pcmBuffer);
+      }
     };
 
-    writeStr(0, "RIFF");
-    view.setUint32(4, 36 + totalLength, true);
-    writeStr(8, "WAVE");
-    writeStr(12, "fmt ");
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, 1, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, sampleRate * 2, true);
-    view.setUint16(32, 2, true);
-    view.setUint16(34, 16, true);
-    writeStr(36, "data");
-    view.setUint32(40, totalLength, true);
+    addLog("Microphone streaming (PCM 16kHz)");
+  };
 
-    const blob = new Blob([wavHeader, ...chunks], { type: "audio/wav" });
-    const url = URL.createObjectURL(blob);
-    const audio = new Audio(url);
-    audio.onended = () => URL.revokeObjectURL(url);
-    audio.play().catch((e) => addLog(`Playback error: ${e.message}`));
+  // ===============================
+  // STOP MICROPHONE
+  // ===============================
+  const stopMic = () => {
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+
+    if (micStreamRef.current) {
+      micStreamRef.current
+        .getTracks()
+        .forEach((track) => track.stop());
+      micStreamRef.current = null;
+    }
+
+    addLog("Microphone stopped");
   };
 
   const handleDisconnect = () => {
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
+    stopMic();
+    if (wsRef.current) wsRef.current.close();
   };
 
   return (
-    <div style={{ padding: 32, fontFamily: "monospace", maxWidth: 600 }}>
-      <h2>WS Audio Tester</h2>
+    <div
+      style={{
+        padding: 32,
+        fontFamily: "monospace",
+        maxWidth: 700,
+      }}
+    >
+      <h2>Voice AI Browser Tester (16kHz PCM)</h2>
+
       <p>
         Status: <strong>{status}</strong>
       </p>
 
-      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
-        <button onClick={handleConnect} disabled={status === "Connected"}>
+      <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+        <button
+          onClick={handleConnect}
+          disabled={status === "Connected"}
+        >
           Connect
         </button>
-        <button onClick={handlePlay} disabled={chunksRef.current?.length === 0}>
-          Play Audio
+
+        <button
+          onClick={startMic}
+          disabled={status !== "Connected"}
+        >
+          Start Talking
         </button>
-        <button onClick={handleDisconnect} disabled={status === "Disconnected"}>
+
+        <button onClick={handleDisconnect}>
           Disconnect
         </button>
       </div>
@@ -126,11 +199,9 @@ function App() {
           fontSize: 13,
         }}
       >
-        {log.length === 0 ? (
-          <span style={{ color: "#555" }}>Logs will appear here…</span>
-        ) : (
-          log.map((entry, i) => <div key={i}>{entry}</div>)
-        )}
+        {log.map((entry, i) => (
+          <div key={i}>{entry}</div>
+        ))}
       </div>
     </div>
   );
