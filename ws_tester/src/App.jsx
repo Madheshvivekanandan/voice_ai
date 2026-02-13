@@ -1,7 +1,6 @@
 import { useRef, useState } from "react";
 
 const WS_URL = "ws://localhost:8000/ws/audio";
-const SAMPLE_RATE = 16000; // 🔥 Best for browser testing
 
 function App() {
   const [status, setStatus] = useState("Disconnected");
@@ -11,6 +10,7 @@ function App() {
   const audioCtxRef = useRef(null);
   const micStreamRef = useRef(null);
   const processorRef = useRef(null);
+  const silentGainRef = useRef(null);
 
   const addLog = (msg) => {
     setLog((prev) => [
@@ -18,6 +18,41 @@ function App() {
       `${new Date().toLocaleTimeString()} — ${msg}`,
     ]);
   };
+
+  // ===============================
+  // DOWNSAMPLE 48kHz → 16kHz
+  // ===============================
+  function downsampleBuffer(buffer, inputRate, outputRate) {
+    if (outputRate === inputRate) return buffer;
+
+    const sampleRateRatio = inputRate / outputRate;
+    const newLength = Math.round(buffer.length / sampleRateRatio);
+    const result = new Float32Array(newLength);
+
+    let offsetResult = 0;
+    let offsetBuffer = 0;
+
+    while (offsetResult < result.length) {
+      const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+      let accum = 0;
+      let count = 0;
+
+      for (
+        let i = offsetBuffer;
+        i < nextOffsetBuffer && i < buffer.length;
+        i++
+      ) {
+        accum += buffer[i];
+        count++;
+      }
+
+      result[offsetResult] = accum / count;
+      offsetResult++;
+      offsetBuffer = nextOffsetBuffer;
+    }
+
+    return result;
+  }
 
   // ===============================
   // CONNECT WEBSOCKET
@@ -32,18 +67,20 @@ function App() {
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 
-    audioCtxRef.current = new (window.AudioContext ||
-      window.webkitAudioContext)({
-      sampleRate: SAMPLE_RATE,
-    });
+    const audioCtx = new (window.AudioContext ||
+      window.webkitAudioContext)();
+    audioCtxRef.current = audioCtx;
+
+    addLog("Actual AudioContext sample rate: " + audioCtx.sampleRate);
 
     ws.onopen = () => {
       setStatus("Connected");
       addLog("WebSocket connected");
+      startMic();
     };
 
     // ===============================
-    // RECEIVE PCM16 AUDIO
+    // RECEIVE TTS AUDIO (16kHz PCM)
     // ===============================
     ws.onmessage = (event) => {
       if (!(event.data instanceof ArrayBuffer)) return;
@@ -61,7 +98,7 @@ function App() {
       const buffer = audioCtx.createBuffer(
         1,
         floatData.length,
-        SAMPLE_RATE
+        16000
       );
 
       buffer.copyToChannel(floatData, 0);
@@ -71,7 +108,7 @@ function App() {
       source.connect(audioCtx.destination);
       source.start();
 
-      addLog(`Playing chunk (${event.data.byteLength} bytes)`);
+      addLog(`Playing audio chunk (${event.data.byteLength} bytes)`);
     };
 
     ws.onclose = () => {
@@ -86,48 +123,64 @@ function App() {
   };
 
   // ===============================
-  // START MICROPHONE STREAMING
+  // START MICROPHONE (WITH RESAMPLING)
   // ===============================
   const startMic = async () => {
-    if (!audioCtxRef.current) return;
+    try {
+      const audioCtx = audioCtxRef.current;
+      if (!audioCtx) return;
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        sampleRate: SAMPLE_RATE,
-        channelCount: 1,
-      },
-    });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
 
-    micStreamRef.current = stream;
+      micStreamRef.current = stream;
 
-    const source =
-      audioCtxRef.current.createMediaStreamSource(stream);
+      const source = audioCtx.createMediaStreamSource(stream);
 
-    const processor =
-      audioCtxRef.current.createScriptProcessor(1024, 1, 1);
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
 
-    processorRef.current = processor;
+      const silentGain = audioCtx.createGain();
+      silentGain.gain.value = 0;
+      silentGainRef.current = silentGain;
 
-    source.connect(processor);
-    processor.connect(audioCtxRef.current.destination);
+      source.connect(processor);
+      processor.connect(silentGain);
+      silentGain.connect(audioCtx.destination);
 
-    processor.onaudioprocess = (e) => {
-      const inputData = e.inputBuffer.getChannelData(0);
+      processor.onaudioprocess = (e) => {
+        const inputData = e.inputBuffer.getChannelData(0);
 
-      const pcmBuffer = new ArrayBuffer(inputData.length * 2);
-      const view = new DataView(pcmBuffer);
+        // 🔥 Downsample to 16kHz
+        const downsampled = downsampleBuffer(
+          inputData,
+          audioCtx.sampleRate,
+          16000
+        );
 
-      for (let i = 0; i < inputData.length; i++) {
-        let s = Math.max(-1, Math.min(1, inputData[i]));
-        view.setInt16(i * 2, s * 32767, true);
-      }
+        const pcmBuffer = new ArrayBuffer(downsampled.length * 2);
+        const view = new DataView(pcmBuffer);
 
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(pcmBuffer);
-      }
-    };
+        for (let i = 0; i < downsampled.length; i++) {
+          let s = Math.max(-1, Math.min(1, downsampled[i]));
+          view.setInt16(i * 2, s * 32767, true);
+        }
 
-    addLog("Microphone streaming (PCM 16kHz)");
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(pcmBuffer);
+        }
+      };
+
+      addLog("Microphone streaming started (16kHz resampled)");
+    } catch (err) {
+      addLog("Microphone access denied");
+      console.error(err);
+    }
   };
 
   // ===============================
@@ -139,10 +192,13 @@ function App() {
       processorRef.current = null;
     }
 
+    if (silentGainRef.current) {
+      silentGainRef.current.disconnect();
+      silentGainRef.current = null;
+    }
+
     if (micStreamRef.current) {
-      micStreamRef.current
-        .getTracks()
-        .forEach((track) => track.stop());
+      micStreamRef.current.getTracks().forEach((track) => track.stop());
       micStreamRef.current = null;
     }
 
@@ -151,7 +207,18 @@ function App() {
 
   const handleDisconnect = () => {
     stopMic();
-    if (wsRef.current) wsRef.current.close();
+
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close();
+      audioCtxRef.current = null;
+    }
+
+    setStatus("Disconnected");
   };
 
   return (
@@ -162,25 +229,15 @@ function App() {
         maxWidth: 700,
       }}
     >
-      <h2>Voice AI Browser Tester (16kHz PCM)</h2>
+      <h2>Voice AI Browser Tester</h2>
 
       <p>
         Status: <strong>{status}</strong>
       </p>
 
       <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
-        <button
-          onClick={handleConnect}
-          disabled={status === "Connected"}
-        >
+        <button onClick={handleConnect} disabled={status === "Connected"}>
           Connect
-        </button>
-
-        <button
-          onClick={startMic}
-          disabled={status !== "Connected"}
-        >
-          Start Talking
         </button>
 
         <button onClick={handleDisconnect}>

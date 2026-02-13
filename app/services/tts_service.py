@@ -3,7 +3,6 @@ import logging
 import math
 import os
 import struct
-from typing import Optional
 import asyncio
 from sarvamai import AsyncSarvamAI, AudioOutput
 from dotenv import load_dotenv
@@ -24,18 +23,12 @@ class SarvamTTSService:
 
         self._client = AsyncSarvamAI(api_subscription_key=api_key)
 
-        # Load browser config safely
-        self.speech_sample_rate = int(
-            os.getenv("browser_speech_sample_rate", 16000)
-        )
-        self.output_audio_codec = os.getenv(
-            "browser_output_audio_codec", "pcm"
-        )
+        # 🔥 IMPORTANT — match what you actually configure
+        self.speech_sample_rate = 16000
 
         logger.info(
-            "TTS initialized — sample_rate=%s codec=%s",
+            "TTS initialized — sample_rate=%s codec=linear16",
             self.speech_sample_rate,
-            self.output_audio_codec,
         )
 
     async def stream_synthesize(self, text: str, websocket) -> None:
@@ -44,15 +37,17 @@ class SarvamTTSService:
         )
 
         try:
+            # 🔥 Enable completion event for clean stream termination
             async with self._client.text_to_speech_streaming.connect(
-                model="bulbul:v3"
+                model="bulbul:v3",
+                send_completion_event=True,
             ) as ws:
 
                 await ws.configure(
                     target_language_code="ta-IN",
                     speaker="pooja",
                     speech_sample_rate=16000,
-                    output_audio_codec="linear16"
+                    output_audio_codec="linear16",
                 )
 
                 await ws.convert(text)
@@ -60,20 +55,24 @@ class SarvamTTSService:
 
                 logger.info("Text sent to TTS stream and flushed")
 
+                # 🔥 Listen for audio chunks and completion event
                 async for message in ws:
 
                     if isinstance(message, AudioOutput):
                         audio_chunk = base64.b64decode(message.data.audio)
-                        # logger.info("Streaming chunk — %d bytes", len(audio_chunk))
                         await websocket.send_bytes(audio_chunk)
-                          # 🔥 Real-time pacing
-                        bytes_per_second = self.speech_sample_rate * 2  # 16-bit PCM
+
+                        # Real-time pacing
+                        bytes_per_second = 16000 * 2  # 16-bit PCM
                         duration = len(audio_chunk) / bytes_per_second
-
                         await asyncio.sleep(duration)
-                    else:
-                        logger.error("Full streaming message: %s", message)
 
+                    else:
+                        # 🔥 Completion event received - exit immediately
+                        logger.info("TTS completion event received: %s", message)
+                        break
+
+                logger.info("TTS stream completed cleanly")
 
         except Exception as e:
             logger.error("Streaming TTS failed: %s", e)
@@ -117,7 +116,6 @@ if __name__ == "__main__":
     async def _test():
         tts = SarvamTTSService()
 
-        # Fake websocket for testing
         class DummyWS:
             async def send_bytes(self, data):
                 print(f"Received chunk: {len(data)} bytes")
