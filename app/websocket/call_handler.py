@@ -1,9 +1,9 @@
 import asyncio
 import logging
-from enum import Enum
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from core.state_machine import ConversationState
 from services.greeting_loader import get_greeting
 from services.llm_service import LLMService
 from services.tts_service import SarvamTTSService
@@ -12,13 +12,6 @@ from services.stt_service import SarvamSTTService
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-
-class ConversationState(Enum):
-    """Turn-based conversation states"""
-    AGENT_SPEAKING = "agent_speaking"  # TTS active, STT ignores audio
-    USER_SPEAKING = "user_speaking"    # STT active, TTS idle
-    PROCESSING = "processing"          # Waiting for LLM response
 
 
 @router.websocket("/ws/audio")
@@ -40,7 +33,8 @@ async def audio_stream(websocket: WebSocket) -> None:
     try:
         # 🔥 STEP 1: Play greeting (AGENT_SPEAKING)
         raw_text = get_greeting()
-        confirmation_message = await llm.generate_confirmation(raw_text)
+        confirmation_data = await llm.generate_confirmation(raw_text)
+        confirmation_message = confirmation_data.get("response", str(confirmation_data))
         logger.info("Confirmation message: %s", confirmation_message)
         
         logger.info("STATE: %s - Playing greeting", state.value)
@@ -120,11 +114,14 @@ async def audio_stream(websocket: WebSocket) -> None:
                             logger.info("STATE: %s - Generating response", state.value)
                             
                             try:
-                                # Generate LLM response
-                                response_text = await llm.generate_confirmation(
+                                # Generate LLM response (Structured JSON)
+                                response_data = await llm.generate_confirmation(
                                     transcript_buffer
                                 )
-                                logger.info("LLM response: %s", response_text)
+                                response_text = response_data.get("response", str(response_data))
+                                end_call = response_data.get("end_conversation", False)
+
+                                logger.info("LLM response: %s (end_call: %s)", response_text, end_call)
                                 
                                 # Transition to AGENT_SPEAKING
                                 state = ConversationState.AGENT_SPEAKING
@@ -133,6 +130,12 @@ async def audio_stream(websocket: WebSocket) -> None:
                                 # Speak the response
                                 await tts.stream_synthesize(response_text, websocket)
                                 logger.info("Agent response completed")
+                                
+                                if end_call:
+                                    await asyncio.sleep(0.3)
+                                    logger.info("Bot decided to end the call based on structured LLM response.")
+                                    await websocket.close()
+                                    break
                                 
                                 # Transition back to USER_SPEAKING
                                 state = ConversationState.USER_SPEAKING
